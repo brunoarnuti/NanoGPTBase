@@ -2,303 +2,189 @@ import os
 import time
 import math
 import pickle
-from contextlib import nullcontext
-
 import numpy as np
 import torch
-
+from torch.nn import functional as F
+from contextlib import nullcontext
 from model import GPTConfig, GPT
+import torch.optim as optim
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
-# default config values designed to train a gpt2 (124M) on OpenWebText
+torch.cuda.empty_cache()
+torch.backends.cudnn.benchmark = True
 
-# I/O # -----------------------------------------------------------------------------
+# Optimal hyperparameters found by Optuna
+opt_config = {
+    "n_layer": 9,
+    "n_embd": 768,
+    "learning_rate": 0.0005212377267634382,
+    "dropout": 0.15935224572057916,
+    "weight_decay": 0.008591969753189597
+}
 
+config = {
+    "out_dir": "out-tiny-stories-final",
+    "eval_interval": 250,
+    "eval_iters": 200,
+    "log_interval": 100,
+    "eval_only": False,
+    "always_save_checkpoint": True,
+    "init_from": "scratch",
+    "wandb_log": False,  # Disabled WandB logging
+    "dataset": "tiny_stories",
+    "gradient_accumulation_steps": 2,
+    "batch_size": 40,
+    "block_size": 256,
+    "bias": False,
+    "n_layer": opt_config["n_layer"],
+    "n_head": 8,
+    "n_embd": opt_config["n_embd"],
+    "dropout": opt_config["dropout"],
+    "grad_clip": 1.0,
+    "beta1": 0.9,
+    "weight_decay": opt_config["weight_decay"],
+    "learning_rate": opt_config["learning_rate"],
+    "max_iters": 100000,
+    "lr_decay_iters": 100000,
+    "min_lr": 1e-6,
+    "beta2": 0.98,
+    "decay_lr": True,
+    "warmup_iters": 1000,
+    "device": "cuda",
+    "dtype": "bfloat16" if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else "float16",
+    "compile": True,
+}
 
-out_dir = 'out-shakespeare-char'
-eval_interval = 250  # keep frequent because we'll overfit
-eval_iters = 200
-log_interval = 10  # don't print too too often
+# Create output directory if it doesn't exist
+os.makedirs(config['out_dir'], exist_ok=True)
 
-eval_only = False  # if True, script exits right after the first eval
+def get_batch(data_dir, split, block_size, batch_size, device):
+    assert split in ['train', 'val'], f"Invalid split: {split}"
 
-# we expect to overfit on this small dataset, so only save when val improves
-always_save_checkpoint = False
+    data_file = os.path.join(data_dir, f"{split}.bin")
+    data = np.memmap(data_file, dtype=np.uint16, mode='r')
 
-init_from = 'scratch'  # 'scratch' or 'resume' or 'gpt2*'
+    indices = torch.randint(len(data) - block_size, (batch_size,))
+    input_data = torch.stack([torch.from_numpy((data[i:i + block_size]).astype(np.int64)) for i in indices])
+    target_data = torch.stack([torch.from_numpy((data[i + 1:i + 1 + block_size]).astype(np.int64)) for i in indices])
 
-# wandb logging # -----------------------------------------------------------------------------
+    if device.type == 'cuda':
+        input_data, target_data = input_data.pin_memory().to(device, non_blocking=True), target_data.pin_memory().to(device, non_blocking=True)
+    else:
+        input_data, target_data = input_data.to(device), target_data.to(device)
 
-wandb_log = False  # override via command line if you like
-wandb_project = 'shakespeare-char'
-wandb_run_name = 'mini-gpt'
+    return input_data, target_data
 
-# data # -----------------------------------------------------------------------------
+@torch.no_grad()
+def estimate_loss(model, data_dir, eval_iters, block_size, batch_size, device, ctx):
+    model.eval()
+    losses = {}
+    for split in ['train', 'val']:
+        split_losses = torch.zeros(eval_iters)
+        for k in range(eval_iters):
+            input_data, target_data = get_batch(data_dir, split, block_size, batch_size, device)
+            with ctx:
+                _, loss = model(input_data, target_data)
+            split_losses[k] = loss.item()
+        losses[split] = split_losses.mean()
+    model.train()
+    return losses
 
-dataset = 'shakespeare_char'
-gradient_accumulation_steps = 1
-batch_size = 64
-block_size = 256  # context of up to 256 previous characters
+def get_lr(iter_num, learning_rate, warmup_iters, lr_decay_iters, min_lr):
+    if iter_num < warmup_iters:
+        return learning_rate * iter_num / warmup_iters
+    if iter_num > lr_decay_iters:
+        return min_lr
+    decay_ratio = (iter_num - warmup_iters) / (lr_decay_iters - warmup_iters)
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+    return min_lr + coeff * (learning_rate - min_lr)
 
-# model # -----------------------------------------------------------------------------
+device = torch.device(config['device'])
+dtype = getattr(torch, config['dtype'])
+ctx = nullcontext() if device.type == 'cpu' else torch.amp.autocast(device_type=device.type, dtype=dtype)
 
-# NOT PRESENT IN train_shakespeare_char.py
-bias = False  # do we use bias inside LayerNorm and Linear layers?
+# Initialize the model
+model_args = {
+    'n_layer': config['n_layer'],
+    'n_head': config['n_head'],
+    'n_embd': config['n_embd'],
+    'block_size': config['block_size'],
+    'bias': config['bias'],
+    'vocab_size': None,
+    'dropout': config['dropout'],
+}
 
-# baby GPT model :)
-n_layer = 6
-n_head = 6
-n_embd = 384
-dropout = 0.2
-
-# adamw optimizer # -----------------------------------------------------------------------------
-
-# NOT PRESENT IN train_shakespeare_char.py
-grad_clip = 1.0  # clip gradients at this value, or disable if == 0.0
-beta1 = 0.9
-weight_decay = 1e-1
-
-learning_rate = 1e-3  # with baby networks can afford to go a bit higher
-max_iters = 5000
-lr_decay_iters = 5000  # make equal to max_iters usually
-min_lr = 1e-4  # learning_rate / 10 usually
-beta2 = 0.99  # make a bit bigger because number of tokens per iter is small
-
-# learning rate decay settings # -----------------------------------------------------------------------------
-
-decay_lr = True  # whether to decay the learning rate
-
-warmup_iters = 100  # not super necessary potentially
-
-# Other settings # -----------------------------------------------------------------------------
-
-iter_num = 0
-best_val_loss = 1e9
-
-# system # -----------------------------------------------------------------------------
-
-device = 'cuda'  # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
-dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16'  # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-compile = True  # use PyTorch 2.0 to compile the model to be faster
-
-# -----------------------------------------------------------------------------
-
-config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
-#exec(open('configurator.py').read()) # overrides from command line or config file
-config = {k: globals()[k] for k in config_keys} # will be useful for logging
-
-# -----------------------------------------------------------------------------
-
-master_process = True
-seed_offset = 0
-ddp_world_size = 1
-
-tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
-
-print(f"tokens per iteration will be: {tokens_per_iter:,}")
-
-if master_process:
-    os.makedirs(out_dir, exist_ok=True)
-
-torch.manual_seed(1337 + seed_offset)
-torch.backends.cuda.matmul.allow_tf32 = True  # allow tf32 on matmul
-torch.backends.cudnn.allow_tf32 = True  # allow tf32 on cudnn
-device_type = 'cuda' if 'cuda' in device else 'cpu'  # for later use in torch.autocast
-
-# note: float16 data type will automatically use a GradScaler
-ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
-ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
-
-# poor man's data loader
-data_dir = os.path.join('data', dataset)
-
-# attempt to derive vocab_size from the dataset
+data_dir = os.path.join('data', config['dataset'])
 meta_path = os.path.join(data_dir, 'meta.pkl')
-meta_vocab_size = None
 if os.path.exists(meta_path):
     with open(meta_path, 'rb') as f:
         meta = pickle.load(f)
-    meta_vocab_size = meta['vocab_size']
-    print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
+    model_args['vocab_size'] = meta['vocab_size']
+    print(f"Found vocab_size = {model_args['vocab_size']} (inside {meta_path})")
+else:
+    model_args['vocab_size'] = 50304
+    print(f"Defaulting to vocab_size of {model_args['vocab_size']}")
 
-# -----------------------------------------------------------------------------
-
-# model init
-model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout)  # start with model_args from command line
-
-# init a new model from scratch
-print("Initializing a new model from scratch")
-# determine the vocab size we'll use for from-scratch training
-if meta_vocab_size is None:
-    print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
-model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
 gptconf = GPTConfig(**model_args)
-model = GPT(gptconf)
+model = GPT(gptconf).to(device)
 
-model.to(device)
+# Initialize optimizer and GradScaler
+optimizer = optim.AdamW(model.parameters(), lr=config['learning_rate'], betas=(config['beta1'], config['beta2']), weight_decay=config['weight_decay'])
+scheduler = CosineAnnealingLR(optimizer, T_max=config['lr_decay_iters'], eta_min=config['min_lr'])
+scaler = torch.cuda.amp.GradScaler(enabled=(dtype == torch.float16))
 
-# initialize a GradScaler. If enabled=False scaler is a no-op
-scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
-
-# optimizer
-optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
-
-# free up memory
-checkpoint = None
-
-# compile the model
-if compile:
-    print("compiling the model... (takes a ~minute)")
+# Compile the model
+if config['compile']:
+    print("Compiling the model... (takes a ~minute)")
     unoptimized_model = model
-    # requires PyTorch 2.0
     model = torch.compile(model)
 
-# logging
-if wandb_log and master_process:
-    import wandb
+iter_num = 0
+best_val_loss = float('inf')
+start_time = time.time()
 
-    wandb.init(project=wandb_project, name=wandb_run_name, config=config)
-    #wandb.init(project=wandb_project, name=wandb_run_name)
-
-
-# ------------------------------END OF CONFIGURATION---------------------------
-
-def get_batch(split):
-    # We recreate np.memmap every batch to avoid a memory leak, as per
-    # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
-    if split == 'train':
-        data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
-    else:
-        data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([torch.from_numpy((data[i:i + block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i + 1:i + 1 + block_size]).astype(np.int64)) for i in ix])
-    if device_type == 'cuda':
-        # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
-        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
-    else:
-        x, y = x.to(device), y.to(device)
-    return x, y
-
-
-# helps estimate an arbitrarily accurate loss over either split using many batches
-@torch.no_grad()
-def estimate_loss():
-    out = {}
-    model.eval()
-    for split in ['train', 'val']:
-        losses = torch.zeros(eval_iters)
-        for k in range(eval_iters):
-            X, Y = get_batch(split)
-            with ctx:
-                logits, loss = model(X, Y)
-            losses[k] = loss.item()
-        out[split] = losses.mean()
-    model.train()
-    return out
-
-
-# learning rate decay scheduler (cosine with warmup)
-def get_lr(it):
-    # 1) linear warmup for warmup_iters steps
-    if it < warmup_iters:
-        return learning_rate * it / warmup_iters
-    # 2) if it > lr_decay_iters, return min learning rate
-    if it > lr_decay_iters:
-        return min_lr
-    # 3) in between, use cosine decay down to min learning rate
-    decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
-    assert 0 <= decay_ratio <= 1
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))  # coeff ranges 0..1
-    return min_lr + coeff * (learning_rate - min_lr)
-
-
-# -----------------------------------------------------------------------------
-
-# training loop
-X, Y = get_batch('train')  # fetch the very first batch
-t0 = time.time()
-local_iter_num = 0  # number of iterations in the lifetime of this process
-
-raw_model = model
-
-running_mfu = -1.0
-while True:
-
-    # determine and set the learning rate for this iteration
-    lr = get_lr(iter_num) if decay_lr else learning_rate
+while iter_num < config['max_iters']:
+    lr = get_lr(iter_num, config['learning_rate'], config['warmup_iters'], config['lr_decay_iters'], config['min_lr']) if config['decay_lr'] else config['learning_rate']
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
-    # evaluate the loss on train/val sets and write checkpoints
-    if iter_num % eval_interval == 0 and master_process:
-        losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-        if wandb_log:
-            wandb.log({
-                "iter": iter_num,
-                "train/loss": losses['train'],
-                "val/loss": losses['val'],
-                "lr": lr,
-                "mfu": running_mfu * 100,  # convert to percentage
-            })
-        if losses['val'] < best_val_loss or always_save_checkpoint:
+    if iter_num % config['eval_interval'] == 0:
+        losses = estimate_loss(
+            model, data_dir, config['eval_iters'], config['block_size'], config['batch_size'], device, ctx
+        )
+        print(f"Step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        if losses['val'] < best_val_loss or config['always_save_checkpoint']:
             best_val_loss = losses['val']
             if iter_num > 0:
                 checkpoint = {
-                    'model': raw_model.state_dict(),
+                    'model': model.state_dict(),
                     'optimizer': optimizer.state_dict(),
                     'model_args': model_args,
                     'iter_num': iter_num,
                     'best_val_loss': best_val_loss,
                     'config': config,
                 }
-                print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
-    if iter_num == 0 and eval_only:
-        break
+                print(f"Saving checkpoint to {config['out_dir']}")
+                torch.save(checkpoint, os.path.join(config['out_dir'], 'ckpt.pt'))
 
-    # forward backward update, with optional gradient accumulation to simulate larger batch size
-    # and using the GradScaler if data type is float16
-    for micro_step in range(gradient_accumulation_steps):
+    input_data, target_data = get_batch(data_dir, 'train', config['block_size'], config['batch_size'], device)
+    for _ in range(config['gradient_accumulation_steps']):
         with ctx:
-            logits, loss = model(X, Y)
-            loss = loss / gradient_accumulation_steps  # scale the loss to account for gradient accumulation
-        # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        X, Y = get_batch('train')
-        # backward pass, with gradient scaling if training in fp16
+            _, loss = model(input_data, target_data)
+            loss = loss / config['gradient_accumulation_steps']
         scaler.scale(loss).backward()
-    # clip the gradient
-    if grad_clip != 0.0:
+    if config['grad_clip'] != 0.0:
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-    # step the optimizer and scaler if training in fp16
+        torch.nn.utils.clip_grad_norm_(model.parameters(), config['grad_clip'])
     scaler.step(optimizer)
     scaler.update()
-    # flush the gradients as soon as we can, no need for this memory anymore
     optimizer.zero_grad(set_to_none=True)
+    scheduler.step()
 
-    # --------------------------- LOGGING ---------------------------
-
-    # timing and logging
-    t1 = time.time()
-    dt = t1 - t0
-    t0 = t1
-    if iter_num % log_interval == 0 and master_process:
-        # get loss as float. note: this is a CPU-GPU sync point
-        # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
-        lossf = loss.item() * gradient_accumulation_steps
-        if local_iter_num >= 5:  # let the training loop settle a bit
-            mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
-            running_mfu = mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt * 1000:.2f}ms, mfu {running_mfu * 100:.2f}%")
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt * 1000:.2f}ms")
+    if iter_num % config['log_interval'] == 0:
+        elapsed_time = time.time() - start_time
+        print(f"Iter {iter_num}: loss {loss.item():.4f}, time {elapsed_time * 1000:.2f}ms")
     iter_num += 1
-    local_iter_num += 1
+    start_time = time.time()
 
-    # --------------------------- LOGGING ---------------------------
-
-    # termination conditions
-    if iter_num > max_iters:
-        break
-
+print("Training complete. Best validation loss: ", best_val_loss)
